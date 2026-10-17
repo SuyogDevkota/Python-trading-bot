@@ -1,0 +1,34 @@
+Python-trading-bot/
+│
+├── config/
+│   └── settings.py
+│
+├── data/
+│   ├── eurusd_h1.csv
+│   └── eurusd_h4.csv
+│
+├── src/
+│   ├── __init__.py
+│   ├── data_feed.py
+│   ├── indicators.py
+│   ├── patterns.py
+│   ├── strategy.py
+│   ├── risk_manager.py
+│   └── trade_manager.py
+│
+├── backtesting/
+│   ├── __init__.py
+│   ├── engine.py
+│   └── report.py
+│
+├── execution/
+│   ├── __init__.py
+│   └── mt5_executor.py
+│
+├── tests/
+│   ├── test_indicators.py
+│   └── test_strategy.py
+│
+├── main.py
+├── requirements.txt
+└── .gitignore
