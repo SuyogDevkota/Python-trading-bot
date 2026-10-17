@@ -59,6 +59,8 @@ def download_candles(timeframe, count, filename):
 
     df = df.sort_values("time").reset_index(drop=True)
     output_path = DATA_DIR / filename
+    price_columns = ["open", "high", "low", "close"]
+    df[price_columns] = df[price_columns].round(5)
     df.to_csv(output_path, index=False)
 
     print(f"\nSaved file: {output_path}")
