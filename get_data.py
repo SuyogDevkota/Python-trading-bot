@@ -1,85 +1,166 @@
-from pathlib import Path
-import pandas as pd
+
 import MetaTrader5 as mt5
+import pandas as pd
+
+from config.settings import (
+    BACKTEST_START,
+    BACKTEST_DATA_DIR,
+    EMA_WARMUP_DIR,
+    EMA_WARMUP_CANDLES,
+    H1_DATA_FILE,
+    H4_DATA_FILE,
+    H1_WARMUP_FILE,
+    H4_WARMUP_FILE,
+    SYMBOL,
+    EXPECTED_SERVER_TEXT,
+)
 
 
-# ----------------------------
-# SETTINGS
-# ----------------------------
 
-SYMBOL = "EURUSDm"  # Symbol to download candles for.1
-# Number of completed candles to download for each timeframe.
-H1_CANDLE_COUNT = 5000
-H4_CANDLE_COUNT = 2000
+def download_candles(timeframe, timeframe_name, price_digits):
+    """ Download historical candles adn split them into warm-up and backtest data."""
 
-# Safety check: only download while connected to an Exness account.
-EXPECTED_SERVER_TEXT = "Exness"
+    # Request sufficient history before the backtest start.
+    # One extra year provides a generous buffer for collecting warm-up candles.
 
-# Always save files inside this project's data folder,
-# regardless of which directory the terminal starts in.
-PROJECT_DIR = Path(__file__).resolve().parent
-DATA_DIR = PROJECT_DIR / "data"
+    backtest_start = pd.Timestamp(BACKTEST_START)
 
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+    request_start = (
+        backtest_start - pd.Timedelta(days=365)
+    ).to_pydatetime()
 
+    # Use current UTC time as the request endpoint.
+    request_end = pd.Timestamp.now(tz="UTC").to_pydatetime()
 
-def download_candles(timeframe, count, filename):
-    """
-    Download candles from MetaTrader 5 and save them to a CSV file
-    """
-    rates = mt5.copy_rates_from_pos(SYMBOL, timeframe, 1, count)
-
-    """
-    Rates is returned by mt5 terminal as a numpy array of tuples. Each tuple contains the following fields:
-    (time, open, high, low, close, tick_volume, spread, real_volume)
-
-    it takes the parameters:
-    - symbol: the symbol to download candles for (e.g., "EURUSD")
-    - timeframe: the timeframe to download candles for (e.g., mt5.TIMEFRAME_H1 for 1-hour candles)
-    - start_pos: the starting position to download candles from (1 means the most recent candle
-
-
-    example:
-        (1792101600, 1.16500, 1.16800, 1.16400, 1.16700, 850, 12, 0)
-        (time, open, high, low, close, tick_volume, spread, real_volume)
-        multiple tuples are returned in a numpy array, one for each candle.
-    """
-
+    rates = mt5.copy_rates_range(
+        SYMBOL,
+        timeframe,
+        request_start,
+        request_end,
+    )
     if rates is None or len(rates) == 0:
         raise RuntimeError(
-            f"No candles received for {SYMBOL}. "
+            f"No {timeframe_name} candles received for {SYMBOL}. "
             f"MT5 error: {mt5.last_error()}"
         )
 
-
     df = pd.DataFrame(rates)
 
-    df["time"] = pd.to_datetime(df["time"], unit="s" , utc=True)
+    # Convert Unix timestamps to UTC-aware pandas timestamps.
+    df["time"] = pd.to_datetime(
+        df["time"],
+        unit="s",
+        utc=True,
+    )
 
-
+    # Sort oldest to newest and remove duplicate timestamps.
+    # Duplicates are unexpected, so fail rather than silently remove them.
     df = df.sort_values("time").reset_index(drop=True)
-    output_path = DATA_DIR / filename
-    price_columns = ["open", "high", "low", "close"]
-    df[price_columns] = df[price_columns].round(5)
-    df.to_csv(output_path, index=False)
 
-    print(f"\nSaved file: {output_path}")
-    print(f"Candles downloaded: {len(df)}")
-    print(f"First candle: {df['time'].iloc[0]}")
-    print(f"Last candle:  {df['time'].iloc[-1]}")
-    print("\nLatest 5 candles:")
-    print(df[["time", "open", "high", "low", "close"]].tail())
+    if df["time"].duplicated().any():
+        raise ValueError(
+            f"Duplicate timestamps found in downloaded {timeframe_name} data."
+        )
+    # Exclude any candle that has not fully closed.
+    # MT5 timestamps identify the candle's opening time.
+    candle_duration = {
+        mt5.TIMEFRAME_H1: pd.Timedelta(hours=1),
+        mt5.TIMEFRAME_H4: pd.Timedelta(hours=4),
+    }[timeframe]
+
+    now_utc = pd.Timestamp.now(tz="UTC")
+
+    df = df[
+        df["time"] + candle_duration <= now_utc
+    ].copy()
+
+    df = df.reset_index(drop=True)
+
+    if df.empty:
+        raise RuntimeError(
+            f"No completed {timeframe_name} candles are available."
+        )
+
+    # Split at the exact backtest start timestamp.
+    warmup_data = df[df["time"] < backtest_start].tail(
+        EMA_WARMUP_CANDLES
+    ).copy()
+
+    backtest_data = df[df["time"] >= backtest_start].copy()
+
+    # Do not continue if there is insufficient warm-up history.
+    if len(warmup_data) < EMA_WARMUP_CANDLES:
+        raise RuntimeError(
+            f"Insufficient {timeframe_name} warm-up data. "
+            f"Required: {EMA_WARMUP_CANDLES}; "
+            f"received: {len(warmup_data)}. "
+            "Check MT5 history availability."
+        )
+
+    if backtest_data.empty:
+        raise RuntimeError(
+            f"No {timeframe_name} candles found on or after "
+            f"{backtest_start}."
+        )
+
+    # Round prices to the symbol's reported decimal precision.
+    price_columns = ["open", "high", "low", "close"]
+
+    for data in (warmup_data, backtest_data):
+        data.loc[:, price_columns] = data[price_columns].round(
+            price_digits
+        )
+
+    # Save to the paths defined in config/settings.py.
+    warmup_path, backtest_path = {
+        mt5.TIMEFRAME_H1: (H1_WARMUP_FILE, H1_DATA_FILE),
+        mt5.TIMEFRAME_H4: (H4_WARMUP_FILE, H4_DATA_FILE),
+    }[timeframe]
+
+    warmup_path.parent.mkdir(parents=True, exist_ok=True)
+    backtest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    warmup_data.to_csv(warmup_path, index=False)
+    backtest_data.to_csv(backtest_path, index=False)
+
+    print(f"\n{'=' * 55}")
+    print(f"{timeframe_name} DATA DOWNLOAD")
+    print(f"{'=' * 55}")
+
+    print(f"Warm-up file: {warmup_path}")
+    print(f"Warm-up candles: {len(warmup_data)}")
+    print(f"Warm-up first candle: {warmup_data['time'].iloc[0]}")
+    print(f"Warm-up last candle:  {warmup_data['time'].iloc[-1]}")
+
+    print(f"\nBacktest file: {backtest_path}")
+    print(f"Backtest candles: {len(backtest_data)}")
+    print(f"Backtest first candle: {backtest_data['time'].iloc[0]}")
+    print(f"Backtest last candle:  {backtest_data['time'].iloc[-1]}")
+
+    print("\nLatest 5 backtest candles:")
+    print(
+        backtest_data[
+            ["time", "open", "high", "low", "close"]
+        ].tail().to_string(index=False)
+    )
+
+    return warmup_data, backtest_data
 
 
 
 def main():
-    # Connect to the MT5 terminal currently running on this computer.
+    """Connect to MT5 and download H1/H4 historical datasets."""
+
+    BACKTEST_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    EMA_WARMUP_DIR.mkdir(parents=True, exist_ok=True)
+
     if not mt5.initialize():
         raise RuntimeError(
             f"MT5 initialization failed: {mt5.last_error()}"
         )
 
     try:
+        # Verify the connected account and broker server.
         account = mt5.account_info()
 
         if account is None:
@@ -90,39 +171,54 @@ def main():
         print("Connected account:", account.login)
         print("Connected server:", account.server)
         print("Company:", account.company)
-        symbols = mt5.symbols_get()
-        print("Available symbols:", [symbol.name for symbol in symbols])
 
-        # Stop rather than download from an unexpected account.
-        if EXPECTED_SERVER_TEXT.lower() not in account.server.lower():
+        if (
+            not account.server
+            or EXPECTED_SERVER_TEXT.lower() not in account.server.lower()
+        ):
             raise RuntimeError(
-                "Safety check failed: the connected server does not "
-                "contain 'Exness'. Check the MT5 account before retrying."
+                f"Safety check failed. Expected a server containing "
+                f"'{EXPECTED_SERVER_TEXT}', but connected to "
+                f"'{account.server}'. No download performed."
+            )
+
+        # Verify and select the exact broker symbol.
+        symbol_info = mt5.symbol_info(SYMBOL)
+
+        if symbol_info is None:
+            raise RuntimeError(
+                f"Symbol '{SYMBOL}' was not found in MT5. "
+                "Check its exact name in Market Watch."
             )
 
         if not mt5.symbol_select(SYMBOL, True):
             raise RuntimeError(
-                f"Could not select {SYMBOL}. "
-                "Check the exact symbol name in MT5."
+                f"Could not select {SYMBOL}: {mt5.last_error()}"
             )
 
-        # Download the two timeframes separately.
+        price_digits = symbol_info.digits
+
+        print("Selected symbol:", SYMBOL)
+        print("Price digits:", price_digits)
+        print("Backtest starts at:", BACKTEST_START)
+        print("Warm-up candles per timeframe:", EMA_WARMUP_CANDLES)
+
+        # Download and split each timeframe independently.
         download_candles(
             mt5.TIMEFRAME_H1,
-            H1_CANDLE_COUNT,
-            "eurusd_h1.csv"
+            "H1",
+            price_digits,
         )
 
         download_candles(
             mt5.TIMEFRAME_H4,
-            H4_CANDLE_COUNT,
-            "eurusd_h4.csv"
+            "H4",
+            price_digits,
         )
 
-        print("\nDownload completed successfully.")
+        print("\nHistorical data download completed successfully.")
 
     finally:
-        # Close the Python connection. This does not close MT5 itself.
         mt5.shutdown()
 
 
